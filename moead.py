@@ -1,16 +1,25 @@
 import numpy as np
+from pymoo.core.problem import ElementwiseProblem
+from pymoo.algorithms.moo.moead import MOEAD
+from pymoo.util.ref_dirs import get_reference_directions
+from pymoo.operators.crossover.ox import OrderCrossover
+from pymoo.operators.mutation.inversion import InversionMutation
+from pymoo.operators.sampling.rnd import PermutationRandomSampling
+from pymoo.optimize import minimize
+import random
 import matplotlib.pyplot as plt
-from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from pymoo.indicators.hv import HV
 from pymoo.indicators.gd import GD
-from mo import run_optimization as run_mo
-from ns import run_optimization as run_ns
-from sp import run_optimization as run_sp
+class HistoryCallback:
+    def __init__(self):
+        self.history = []
+    
+    def __call__(self, algorithm): 
+        self.history.append(algorithm.pop.copy())
 
-
-
-# Dictionnaire global des temps de traitement
-processing_times = {  (0, 0): (11, 6), (0, 1): (15, 8), (0, 2): (17, 9), (0, 3): (8, 3), (0, 4): (13, 7),
+# ======== Dictionnaire global des temps de traitement ========
+processing_times = {
+   (0, 0): (11, 6), (0, 1): (15, 8), (0, 2): (17, 9), (0, 3): (8, 3), (0, 4): (13, 7),
         (1, 0): (8, 2), (1, 1): (6, 1), (1, 2): (7, 2), (1, 3): (9, 1), (1, 4): (5, 2),
         (2, 0): (13, 2), (2, 1): (10, 1), (2, 2): (9, 2), (2, 3): (7, 1), (2, 4): (11, 2),
         (3, 0): (7, 3), (3, 1): (12, 7), (3, 2): (9, 5), (3, 3): (14, 8), (3, 4): (6, 4),
@@ -149,159 +158,276 @@ processing_times = {  (0, 0): (11, 6), (0, 1): (15, 8), (0, 2): (17, 9), (0, 3):
         (136, 0): (7, 2), (136, 1): (13, 1), (136, 2): (8, 2), (136, 3): (11, 1), (136, 4): (9, 2),
         (137, 0): (14, 7), (137, 1): (9, 4), (137, 2): (12, 6), (137, 3): (7, 3), (137, 4): (10, 5),
         (138, 0): (10, 1), (138, 1): (6, 2), (138, 2): (11, 1), (138, 3): (13, 2), (138, 4): (8, 1),
-        (139, 0): (12, 6), (139, 1): (7, 3), (139, 2): (14, 8), (139, 3): (10, 5), (139, 4): (9, 4)} 
-# Configuration des instances à tester
-# Paramètres des algorithmes (ajoutés)
-algo_params = {
-    "MOEAD": {"pop_size": 100, "crossover_prob": 0.5},
-    "NSGA2": {"pop_size": 100, "crossover_prob": 0.9, "mutation_prob": 0.6},
-    "SPEA2": {"pop_size": 100, "mutation_prob": 0.9}
+        (139, 0): (12, 6), (139, 1): (7, 3), (139, 2): (14, 8), (139, 3): (10, 5), (139, 4): (9, 4)
 }
 
-# Configuration des instances à tester (modifiée)
-configs = [
-    (20, 3),   # Petite instance
-    (60, 5),   # Instance moyenne
-    (140, 10)  # Grande instance
-]
-
-# Dictionnaire des algorithmes
-algorithms = {
-    "MOEAD": run_mo,
-    "NSGA2": run_ns,
-    "SPEA2": run_sp
-}
-
-# Couleurs et styles pour les algorithmes
-algo_styles = {
-    "MOEAD": {"color": "blue", "linestyle": "-", "marker": "o", "markersize": 7},
-    "NSGA2": {"color": "red", "linestyle": "--", "marker": "s", "markersize": 7},
-    "SPEA2": {"color": "green", "linestyle": "-.", "marker": "^", "markersize": 7}
-}
-
-for n_jobs, n_stages in configs:
+def run_optimization(n_jobs, n_stages, plot=True):
+    # ======== Configuration des paramètres ========
     print(f"\n{'='*50}")
-    print(f"Processing configuration: {n_jobs} jobs, {n_stages} stages")
-    print(f"{'='*50}")
+    print(f"Optimisation pour {n_jobs} jobs et {n_stages} étapes")
+    print(f"{'='*50}\n")
     
-    results = {}
-    histories = {}
+    # 1. Configuration des ressources
+    max_resources = []
+    for stage in range(n_stages):
+        if stage == 0:
+            max_resources.append([3, 5, 0])
+        elif stage == 1:
+            max_resources.append([0, 5, 4])
+        else:
+            max_resources.append([4, 0, 0])
     
-    # 1. Run algorithms and collect results
-    for algo_name, algo_func in algorithms.items():
-        print(f"Running {algo_name}...")
-        res, history = algo_func(n_jobs, n_stages, plot=False)
-        results[algo_name] = res
-        histories[algo_name] = history
-        print(f"Completed {algo_name}")
+    # 2. Paramètres énergétiques
+    P_run = [1.0] * n_stages
+    P_sb  = [0.5] * n_stages
+
+    # ======== Définition du problème ========
+    class HFSProblem(ElementwiseProblem):
+        def __init__(self):
+            super().__init__(
+                n_var=n_jobs,
+                n_obj=2,
+                n_constr=0,
+                xl=0,
+                xu=n_jobs-1,
+                vtype=int
+            )
+            self.max_resources = max_resources
+            self.processing_times = processing_times
+            self.P_run = P_run
+            self.P_sb = P_sb
+        
+        def assign_resources(self, job, stage):
+            """Assignation des ressources selon les règles de l'étape"""
+            max_skilled, max_ordinary, max_robots = self.max_resources[stage]
+            
+            if stage == 0:
+                N_s = random.randint(1, max_skilled)
+                N_o = random.randint(0, max_ordinary)
+                return N_s, N_o, 0
+            elif stage == 1:
+                if random.random() < 0.5:
+                    N_o = random.randint(1, max_ordinary)
+                    return 0, N_o, 0
+                else:
+                    R = random.randint(1, max_robots)
+                    return 0, 0, R
+            else:
+                N_s = random.randint(1, max_skilled)
+                return N_s, 0, 0
+        
+        def calculate_completion_times(self, permutation):
+            """Calcul des temps d'achèvement"""
+            completion_times = np.zeros((n_stages, n_jobs))
+            resource_usage = []
+            
+            for stage in range(n_stages):
+                stage_times = []
+                
+                for pos, job_id in enumerate(permutation):
+                    job = job_id
+                    
+                    # Assignation des ressources
+                    N_s, N_o, R = self.assign_resources(job, stage)
+                    total_workers = N_s + N_o + R
+                    
+                    # Gestion des étapes au-delà de 4
+                    stage_key = stage if stage < 5 else stage % 5
+                    p_time = self.processing_times.get((job, stage_key), (10, 0))[0]
+                    
+                    # Temps de traitement réel
+                    duration = p_time / total_workers
+                    
+                    # Calcul du temps de début
+                    if stage == 0 and pos == 0:
+                        start_time = 0
+                    elif stage == 0:
+                        start_time = completion_times[stage][pos-1]
+                    elif pos == 0:
+                        start_time = completion_times[stage-1][pos]
+                    else:
+                        start_time = max(
+                            completion_times[stage][pos-1],
+                            completion_times[stage-1][pos]
+                        )
+                    
+                    # Mise à jour des temps
+                    end_time = start_time + duration
+                    completion_times[stage][pos] = end_time
+                    stage_times.append((start_time, end_time, job, N_s, N_o, R))
+                
+                resource_usage.append(stage_times)
+            
+            return completion_times, resource_usage
+        
+        def calculate_energy(self, completion_times, resource_usage):
+            """Calcul de la consommation énergétique"""
+            EC_r = 0.0
+            EC_s = 0.0
+            
+            for stage in range(n_stages):
+                stage_times = resource_usage[stage]
+                total_processing = 0.0
+                
+                for job_data in stage_times:
+                    start, end, job_id, N_s, N_o, R = job_data
+                    duration = end - start
+                    total_workers = N_s + N_o + R
+                    EC_r += total_workers * duration * self.P_run[stage]
+                    total_processing += duration
+                
+                stage_makespan = np.max(completion_times[stage])
+                standby_time = stage_makespan - total_processing
+                EC_s += standby_time * self.P_sb[stage]
+            
+            return EC_r, EC_s
+        
+        def _evaluate(self, x, out, *args, **kwargs):
+            permutation = x.astype(int)
+            completion_times, resource_usage = self.calculate_completion_times(permutation)
+            
+            makespan = np.max(completion_times[-1])
+            EC_r, EC_s = self.calculate_energy(completion_times, resource_usage)
+            TEC = EC_r + EC_s
+            
+            out["F"] = [makespan, TEC]
+
+    # ======== Configuration de MOEA/D ========
+    pop_size_desired = min(100, n_jobs*2)
+    ref_dirs = get_reference_directions("uniform", 2, n_partitions=pop_size_desired-1)
     
-    # 2. Calculate global indicators
-    all_objs = np.vstack([ind.F for history in histories.values() for gen in history for ind in gen])
-    ref_point = np.max(all_objs, axis=0) * 1.10
+    if len(ref_dirs) < pop_size_desired:
+        ref_dirs = get_reference_directions("uniform", 2, n_points=pop_size_desired)
     
-    # 3. Get reference Pareto front
-    final_populations = np.vstack([ind.F for res in results.values() for ind in res.pop])
-    pareto_idx = NonDominatedSorting().do(final_populations, only_non_dominated_front=True)
-    pf = final_populations[pareto_idx]
+    algorithm = MOEAD(
+        ref_dirs=ref_dirs,
+        n_neighbors=15,
+        prob_neighbor_mating=0.7,
+        sampling=PermutationRandomSampling(),
+        crossover=OrderCrossover(),
+        mutation=InversionMutation()
+    )
+
+    # ======== Optimisation ========
+    problem = HFSProblem()
+    history_callback = HistoryCallback()  # Initialiser le callback
     
-    # 4. Calculate generational metrics (with normalized GD)
-    indicators = {algo: {"HV": [], "GD": []} for algo in algorithms}
-    ref_hv_value = HV(ref_point)(pf)
-    for algo_name, history in histories.items():
+    res = minimize(
+        problem,
+        algorithm,
+        termination=('n_gen', max(50, n_jobs//2)),
+        seed=random.randint(1, 1000),
+        verbose=False,
+        callback=history_callback  # Ajouter le callback
+    )
+    # Initialisation du callback pour l'historique
+    history_callback = HistoryCallback() 
+    
+    res = minimize(
+        problem,
+        algorithm,
+        ('n_gen', max(50, n_jobs//2)),
+        seed=random.randint(1, 1000),
+        verbose=False,
+        callback=history_callback
+    )
+    # ======== Résultats (syntaxe préservée) ========
+    print(f"Results for {n_jobs} jobs and {n_stages} stages:")
+    
+    if len(res.pop) > 0:
+        best_makespan = min(res.pop, key=lambda ind: ind.F[0])
+        best_energy = min(res.pop, key=lambda ind: ind.F[1])
+        
+        print("\nBest makespan solution:")
+        print(f"  Makespan = {best_makespan.F[0]:.2f}")
+        print(f"  TEC = {best_makespan.F[1]:.2f}")
+        
+        print("\nBest energy solution:")
+        print(f"  Makespan = {best_energy.F[0]:.2f}")
+        print(f"  TEC = {best_energy.F[1]:.2f}")
+        
+        # Visualisation conditionnelle
+        if plot:
+              plot_results(res, n_jobs, n_stages, history_callback.history)
+        print("No solutions found!")
+    
+    return res, history_callback.history
+
+    # ======== Résultats ========
+def plot_results(res, n_jobs, n_stages, history):
+    if res is None or not hasattr(res, 'pop') or len(res.pop) == 0:
+        print(f"No results to plot for {n_jobs} jobs and {n_stages} stages")
+        return
+    
+    plt.figure(figsize=(15, 4))
+    
+    # 1. Front de Pareto
+    plt.subplot(131)
+    F = np.array([ind.F for ind in res.pop])
+    plt.scatter(F[:, 1], F[:, 0], c='blue', alpha=0.7)
+    plt.xlabel('TEC')
+    plt.ylabel('Makespan')
+    plt.title(f'Pareto Front ({n_jobs} jobs, {n_stages} stages)')
+    plt.grid(True)
+    
+    # 2. Calcul des indicateurs HV et GD
+    if history:
+        gen_count = len(history)
+        hv_vals = []
+        gd_vals = []
+        
+        # Point de référence pour HV (10% au-dessus du max observé)
+        all_objs = np.array([ind.F for gen in history for ind in gen])
+        ref_point = np.max(all_objs, axis=0) * 1.10
+        
+        # Front de référence pour GD (front final)
+        pf = np.array([ind.F for ind in res.opt]) if hasattr(res, 'opt') else np.array([])
+        
+        # Initialisation des calculateurs
+        hv_calculator = HV(ref_point=ref_point)
+        if len(pf) > 0:
+            gd_calculator = GD(pf)
+        
+        # Calcul par génération
         for gen in history:
             objs = np.array([ind.F for ind in gen])
-            # Calculate normalized HV
-            hv_value = HV(ref_point)(objs)
-            normalized_hv = hv_value / ref_hv_value
-            indicators[algo_name]["HV"].append(normalized_hv)
-            
-            # Calculate normalized GD
-            gd_value = GD(pf)(objs)
-            normalized_gd = gd_value / len(pf)
-            indicators[algo_name]["GD"].append(normalized_gd)
+            hv_vals.append(hv_calculator(objs))
+            if len(pf) > 0:
+                gd_vals.append(gd_calculator(objs))
+        
+        # 2. Évolution de l'Hypervolume
+        plt.subplot(132)
+        plt.plot(range(1, gen_count+1), hv_vals, 'g-', linewidth=2)
+        plt.xlabel('Generation')
+        plt.ylabel('HV Value')
+        plt.title('Hypervolume (HV) Evolution')
+        plt.grid(True)
+        
+        # 3. Évolution de la Distance Générationnelle
+        plt.subplot(133)
+        if gd_vals:
+            plt.plot(range(1, gen_count+1), gd_vals, 'r-', linewidth=2)
+            plt.xlabel('Generation')
+            plt.ylabel('GD Value')
+            plt.title('Generational Distance (GD) Evolution')
+            plt.grid(True)
     
-    # 5. Create visualizations
-    # 5.1 Pareto Front Comparison
-    plt.figure(figsize=(10, 6))
-    for algo_name, res in results.items():
-        F = np.array([ind.F for ind in res.pop])
-        plt.scatter(
-            F[:, 1], F[:, 0],
-            label=algo_name,
-            alpha=0.8,
-            s=50,
-            c=algo_styles[algo_name]["color"],
-            marker=algo_styles[algo_name]["marker"]
-        )
-    plt.xlabel('Total Energy Consumption (TEC)', fontsize=12)
-    plt.ylabel('Makespan', fontsize=12)
-    plt.title(f'Pareto Front Comparison ({n_jobs} jobs, {n_stages} stages)', fontsize=14)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(fontsize=12)
     plt.tight_layout()
-    plt.savefig(f'pareto_{n_jobs}j_{n_stages}s.png', dpi=300)
+    plt.savefig(f'results_{n_jobs}j_{n_stages}s.png', dpi=300)
     plt.show()
+if __name__ == "__main__":
+    # Configuration des instances à tester
+    configs = [
+        (20, 3),   # Petite instance
+        (60, 5),   # Instance moyenne
+        (140, 10)  # Grande instance
+    ]
     
-    # 5.2 Hypervolume Evolution
-    plt.figure(figsize=(10, 6))
-    for algo_name, data in indicators.items():
-        plt.plot(
-            data["HV"],
-            label=algo_name,
-            linewidth=2.5,
-            color=algo_styles[algo_name]["color"],
-            linestyle=algo_styles[algo_name]["linestyle"],
-            marker=algo_styles[algo_name]["marker"],
-            markersize=algo_styles[algo_name]["markersize"],
-            markevery=5
-        )
-    plt.xlabel('Generation', fontsize=12)
-    plt.ylabel('Hypervolume (HV)', fontsize=12)
-    plt.title(f'Hypervolume Evolution ({n_jobs} jobs, {n_stages} stages)', fontsize=14)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(fontsize=12)
-    plt.tight_layout()
-    plt.savefig(f'hv_{n_jobs}j_{n_stages}s.png', dpi=300)
-    plt.show()
-    
-    # 5.3 Generational Distance Evolution
-    plt.figure(figsize=(10, 6))
-    for algo_name, data in indicators.items():
-        plt.plot(
-            data["GD"],
-            label=algo_name,
-            linewidth=2.5,
-            color=algo_styles[algo_name]["color"],
-            linestyle=algo_styles[algo_name]["linestyle"],
-            marker=algo_styles[algo_name]["marker"],
-            markersize=algo_styles[algo_name]["markersize"],
-            markevery=5
-        )
-    plt.xlabel('Generation', fontsize=12)
-    plt.ylabel('Normalized Generational Distance (GD)', fontsize=12)
-    plt.title(f'Generational Distance Evolution ({n_jobs} jobs, {n_stages} stages)', fontsize=14)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(fontsize=12)
-    plt.tight_layout()
-    plt.savefig(f'gd_{n_jobs}j_{n_stages}s.png', dpi=300)
-    plt.show()
-    
-    # 6. Performance summary table
-   # Collect best indicators
-    table_data = []
-    headers = ["Algorithm", "Best HV", "Best GD"]
-    
-    for algo_name in algorithms:
-        best_hv = max(indicators[algo_name]["HV"])
-        best_gd = min(indicators[algo_name]["GD"])
-        table_data.append([algo_name, best_hv, best_gd])
-    
-    # Fixed table printing with proper formatting
-    print(f"{'Algorithm':<10} | {'Best HV':<15} | {'Best GD':<15}")
-    print("-" * 45)
-    for row in table_data:
-        print(f"{row[0]:<10} | {row[1]:<15.6f} | {row[2]:<15.6f}")
-    
-    print("\n\n")
-    
-    print(f"Completed comparison for {n_jobs} jobs and {n_stages} stages")
+    for n_jobs, n_stages in configs:
+        print(f"\n{'='*50}")
+        print(f"Running optimization for {n_jobs} jobs and {n_stages} stages...")
+        res = run_optimization(n_jobs, n_stages, plot=True)
+        
+        print(f"\n{'='*50}")
+        print(f"Completed optimization for {n_jobs} jobs and {n_stages} stages")
+        print(f"{'='*50}\n")
