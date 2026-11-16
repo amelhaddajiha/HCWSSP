@@ -4,13 +4,6 @@
 # Number of stages (s)
 5
 
-
-# Maximum resources per stage (qualified welders, ordinary welders, robots)
-3 5 4
-3 5 4
-3 5 4
-3 5 4
-3 5 4
 # Processing time (task, stage): (qualified welder time, ordinary welder time)
 # Task 0
 (8, 4) (16, 8) (16, 12) (10, 6) (12, 5)
